@@ -23,6 +23,7 @@ add_llvm_component_library(LLVMPasses
   InstCombine
   IRPrinter
   ObjCARC
+  RGM
   Scalar
   Support
   Target
