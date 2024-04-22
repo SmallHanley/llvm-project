@@ -10,7 +10,7 @@
 // in docs/WritingAnLLVMPass.html
 //
 //===----------------------------------------------------------------------===//
-#include "CFMelder.h"
+#include "llvm/Transforms/RGM/CFMelder.h"
 #include "CFMelderUtils.h"
 #include "RegionMelder.h"
 #include "llvm/ADT/PostOrderIterator.h"

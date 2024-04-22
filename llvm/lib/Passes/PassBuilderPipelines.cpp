@@ -71,6 +71,7 @@
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
 #include "llvm/Transforms/Instrumentation/MemProfiler.h"
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
+#include "llvm/Transforms/RGM/CFMelder.h"
 #include "llvm/Transforms/RGM/rgm.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/AlignmentFromAssumptions.h"
@@ -279,6 +280,10 @@ static cl::opt<AttributorRunOption> AttributorRun(
                           "enable call graph SCC attributor runs"),
                clEnumValN(AttributorRunOption::NONE, "none",
                           "disable attributor runs")));
+
+static cl::opt<bool> EnableCFMelder(
+    "enable-cfmelder", cl::init(false), cl::Hidden,
+    cl::desc("enable cfmelder"));
 
 static cl::opt<bool> EnableRGM(
     "enable-rgm", cl::init(false), cl::Hidden,
@@ -1068,13 +1073,16 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   if (EnableSyntheticCounts && !PGOOpt)
     MPM.addPass(SyntheticCountsPropagation());
 
-  if (EnableRGM)
-    MPM.addPass(RegionMergingModulePass());
-
   if (EnableModuleInliner)
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));
   else
     MPM.addPass(buildInlinerPipeline(Level, Phase));
+
+  if (EnableCFMelder)
+    MPM.addPass(CFMelderCodeSizePass());
+
+  if (EnableRGM)
+    MPM.addPass(RegionMergingModulePass());
 
   // Remove any dead arguments exposed by cleanups, constant folding globals,
   // and argument promotion.
