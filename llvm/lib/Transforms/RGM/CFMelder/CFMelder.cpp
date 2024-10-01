@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/RGM/CFMelder.h"
 #include "CFMelderUtils.h"
+#include "FunctionMerging.h"
 #include "RegionMelder.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/Statistic.h"
@@ -34,7 +35,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "FunctionMerging.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -47,6 +47,8 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "cfmelder"
+
+STATISTIC(NumMerged, "Number of merged");
 
 static cl::opt<bool>
     ForceMerging("force-cf-merging", cl::init(false), cl::Hidden,
@@ -304,6 +306,7 @@ static bool runImplCodeSize(Function &F, DominatorTree &DT,
             for (int I : Profitable) {
               RegionMelder RM(RA);
               RM.merge(I);
+              NumMerged++;
             }
             LocalChange = true;
           }
@@ -514,7 +517,8 @@ PreservedAnalyses CFMelderCodeSizePass::run(Module &M,
 // INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
 // INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 // INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
-// INITIALIZE_PASS_END(CFMelderLegacyPass, "cfmelder", "Meld similar control-flow",
+// INITIALIZE_PASS_END(CFMelderLegacyPass, "cfmelder", "Meld similar
+// control-flow",
 //                     false, false)
 
 // char CFMelderCodeSizeLegacyPass::ID = 0;
@@ -526,8 +530,8 @@ PreservedAnalyses CFMelderCodeSizePass::run(Module &M,
 // INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 // INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
 // INITIALIZE_PASS_END(CFMelderCodeSizeLegacyPass, "cfmelder-codesize",
-//                     "Meld similar control-flow for code size reduction", false,
-//                     false)
+//                     "Meld similar control-flow for code size reduction",
+//                     false, false)
 
 // // Initialization Routines
 // void llvm::initializeCFMelder(PassRegistry &Registry) {

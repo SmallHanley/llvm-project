@@ -31,9 +31,58 @@ using namespace llvm;
 
 #define Debug true
 #define EnableSALSSACoalescing true
+#define ENABLE_TIMING
+
+#define MATCH_NUM 20
+#define MATCH_RATIO 0.3
+#define SCORE_THRESHOLD 0.4
 
 #define DEBUG_TYPE "rgm"
-STATISTIC(profitableRegions, "The # of profitable region pairs");
+STATISTIC(regionNotExistNum, "The # of not exist regions");
+STATISTIC(adjacentRegionNum, "The # of adjacent regions");
+STATISTIC(mergeGenFailNum, "The # of error during merge gen regions");
+STATISTIC(ProcessPHIsErrorNum, "The # of error during processing PHIs");
+STATISTIC(notProfitableLocalNum,
+          "The # of locally not profitable region pairs");
+STATISTIC(commitChangesErrorNum, "The # of error during commiting change");
+STATISTIC(matchedRegionPairsNum, "The # of matched region pairs");
+STATISTIC(mergeRegionPairsNum, "The # of merge region pairs");
+STATISTIC(notProfitableGlobalNum,
+          "The # of globally not profitable region pairs");
+STATISTIC(runRegionMatchTime,
+          "Time spent in collecting leaf region in microseconds");
+STATISTIC(findSimilarRegionTime, "Time spent in collecting isomorphic region "
+                                 "and calculating score in microseconds");
+STATISTIC(candidatesRankingTime,
+          "Time spent in candidate ranking in microseconds");
+STATISTIC(regionMergingTime, "Time spent in region merging in microseconds");
+STATISTIC(alignBlocksTime, "Time spent in sequence alignment in microseconds");
+STATISTIC(mergeGenTime, "Time spent in merging locally in microseconds");
+STATISTIC(getRegionTime, "Time spent in getting region in microseconds");
+STATISTIC(resumeCodeTime, "Time spent in resuming code in microseconds");
+STATISTIC(allTime, "Time spent totally in microseconds");
+STATISTIC(regionSize, "The region size");
+STATISTIC(hasBranchFusion, "Check has branch fusion");
+
+static cl::opt<double> scoreThreshold("rgm-score-threshold", cl::init(0.35),
+                                      cl::Hidden,
+                                      cl::desc("rgm-score-threshold"));
+
+static cl::opt<double> matchRatio("rgm-match-ratio", cl::init(0.55), cl::Hidden,
+                                  cl::desc("rgm-match-ratio"));
+
+static cl::opt<int> regionSizeThreshold("rgm-rgs-threshold", cl::init(15),
+                                        cl::Hidden,
+                                        cl::desc("rgm-rgs-threshold"));
+
+static cl::opt<int> matchThreshold("rgm-match-threshold", cl::init(20),
+                                   cl::Hidden, cl::desc("rgm-match-threshold"));
+
+static cl::opt<double> matchArg("rgm-match-arg", cl::init(0.3), cl::Hidden,
+                                cl::desc("rgm-match-arg"));
+
+// static cl::opt<bool> enableBfcase("rgm-enable-bfcase", cl::init(true),
+//                                   cl::Hidden, cl::desc("rgm-enable-bfcase"));
 
 class SESERegion {
 public:
@@ -94,6 +143,8 @@ private:
 public:
   int matchId;
   int level;
+  BasicBlock *EntryBlock;
+  BasicBlock *ExitBlock;
 
   RegionTree(Region *region) : region(region), matchId(-1), level(0) {
     for (auto it : region->blocks()) {
@@ -102,6 +153,8 @@ public:
     if (auto r = region->getExit()) {
       blocks.push_back(r);
     }
+    EntryBlock = region->getEntry();
+    ExitBlock = region->getExit();
   }
 
   Region *getRegion() { return region; }
@@ -143,6 +196,24 @@ static bool simplifyFunction(Function &F, TargetTransformInfo &TTI,
   return Changed;
 }
 
+static int readCounter(const std::string &filename) {
+  std::ifstream infile(filename);
+  int counter = 0;
+  if (infile.is_open()) {
+    infile >> counter;
+    infile.close();
+  }
+  return counter;
+}
+
+static void writeCounter(const std::string &filename, int counter) {
+  std::ofstream outfile(filename);
+  if (outfile.is_open()) {
+    outfile << counter;
+    outfile.close();
+  }
+}
+
 static bool runRegionMatch(Function &F, DominatorTree &DT,
                            PostDominatorTree &PDT, LoopInfo &LI,
                            TargetTransformInfo &TTI,
@@ -160,8 +231,8 @@ static bool runRegionMatch(Function &F, DominatorTree &DT,
     RegionTree *parent = WorkList.pop_back_val();
     Region *R = parent->getRegion();
     if (R->begin() == R->end()) {
-      if (R->isSimple())
-        regions.push_back(parent);
+      // if (R->isSimple())
+      regions.push_back(parent);
       continue;
     }
     std::vector<RegionTree *> childArr;
@@ -175,36 +246,6 @@ static bool runRegionMatch(Function &F, DominatorTree &DT,
   }
 
   return false;
-}
-
-static void ComputeSARegionMatch(SmallVectorImpl<Region *> &LeftRegions,
-                                 SmallVectorImpl<Region *> &RightRegions) {
-  RegionMeldingProfitabilityModel ScoringFunc;
-  auto SMSA =
-      SmithWaterman<Region *, SmallVectorImpl<Region *>, nullptr>(ScoringFunc);
-
-  auto Result = SMSA.compute(LeftRegions, RightRegions);
-  int AlignedReginPairs = 0;
-  for (auto Entry : Result) {
-    Region *L = Entry.getLeft();
-    Region *R = Entry.getRight();
-    if (Entry.match()) {
-      RegionComparator RC(L, R);
-      bool Check = RC.compare();
-      assert(Check && "Aligned regions are not similar!");
-      std::shared_ptr<MergeableRegionPair> RegionPair =
-          std::make_shared<MergeableRegionPair>(*L, *R, RC);
-
-      // BestRegionMatch.push_back(RegionPair);
-      AlignedReginPairs++;
-      L->dump();
-      errs() << "--------------\n";
-      R->dump();
-      errs() << "==============\n";
-    }
-  }
-
-  errs() << "Number of aligned region pairs : " << AlignedReginPairs << "\n";
 }
 
 static int Find(std::vector<int> &group, int v) {
@@ -245,8 +286,8 @@ static void findSimilarRegion(std::vector<RegionTree *> &regions,
         }
         if (check) {
           it->level = level + 1;
-          if (it->getRegion()->isSimple())
-            regions.push_back(it);
+          // if (it->getRegion()->isSimple())
+          regions.push_back(it);
         }
       }
     }
@@ -263,6 +304,12 @@ static void findSimilarRegion(std::vector<RegionTree *> &regions,
                  "Region level must match!");
           std::shared_ptr<MergeableRegionPair> regionPair =
               std::make_shared<MergeableRegionPair>(*R1, *R2, RC);
+          // errs() << "getSimilarityScore: " <<
+          // regionPair->getSimilarityScore() << "\n";
+          if (regionPair->getSimilarityScore() < scoreThreshold) {
+            continue;
+          }
+
           Match m = {.match = {regions[i], regions[j]},
                      .similarityScores = regionPair->getSimilarityScore(),
                      .level = regions[i]->level};
@@ -282,6 +329,19 @@ static void findSimilarRegion(std::vector<RegionTree *> &regions,
       }
     }
   }
+}
+
+static void candidatesRanking(std::vector<Match> &matches) {
+  auto cmp = [](const Match &v1, const Match &v2) {
+    if (v1.level == v2.level) {
+      return v1.similarityScores > v2.similarityScores;
+    } else {
+      return v1.level > v2.level;
+    }
+    // return v1.similarityScores > v2.similarityScores;
+  };
+
+  std::sort(matches.begin(), matches.end(), cmp);
 }
 
 static std::string GetValueName(const Value *V) {
@@ -353,8 +413,8 @@ static void StoreInstIntoAddr(Instruction *IV, Value *Addr) {
   }
 }
 
-static AllocaInst *MemfyInst(Function &F, std::set<Instruction *> &InstSet) {
-  BasicBlock *PreBB = &(F.getEntryBlock());
+static AllocaInst *MemfyInst(Function *F, std::set<Instruction *> &InstSet) {
+  BasicBlock *PreBB = &(F->getEntryBlock());
   if (InstSet.empty())
     return nullptr;
   IRBuilder<> Builder(&*PreBB->getFirstInsertionPt());
@@ -413,13 +473,13 @@ static AllocaInst *MemfyInst(Function &F, std::set<Instruction *> &InstSet) {
   return Addr;
 }
 
-static bool commitChanges(Function &F) {
+static bool commitChanges(Function *F) {
 
 #ifdef TIME_STEPS_DEBUG
   TimeCodeGenFix.startTimer();
 #endif
 
-  Function *MergedFunc = &F;
+  Function *MergedFunc = F;
 
   std::vector<AllocaInst *> Allocas;
 
@@ -583,6 +643,7 @@ static bool commitChanges(Function &F) {
     */
     if (Debug) {
       errs() << "Fixing Domination\n";
+      errs() << "LinearOffendingInsts: " << LinearOffendingInsts.size() << '\n';
       // MergedFunc->dump();
     }
     std::set<Instruction *> Visited;
@@ -614,6 +675,10 @@ static bool commitChanges(Function &F) {
         Allocas.push_back(Addr);
 
       errs() << "next\n";
+    }
+
+    if (Allocas.size() > 3) {
+      return false;
     }
 
     // MergedFunc->dump();
@@ -660,28 +725,821 @@ static bool commitChanges(Function &F) {
   return MergedFunc != nullptr;
 }
 
-static void runImpl(Function &F, DominatorTree &DT, PostDominatorTree &PDT,
-                    LoopInfo &LI, TargetTransformInfo &TTI) {
+static Function *regionMerging(Function *F, DominatorTree &DT,
+                               PostDominatorTree &PDT, LoopInfo &LI,
+                               TargetTransformInfo &TTI, Match &match) {
+  auto it = match.match;
 
-  // runAnalysisOnly(F, DT, PDT, LI, TTI);
-  std::vector<RegionTree *> regions;
+  if (it.first->matchId > 0)
+    it.first->matchId = 0;
 
-  runRegionMatch(F, DT, PDT, LI, TTI, regions);
-  // melding(F, DT, PDT, LI, TTI);
-  std::vector<Match> matches;
-  findSimilarRegion(regions, matches);
+  if (it.second->matchId > 0)
+    it.second->matchId = 0;
 
-  auto cmp = [](const Match &v1, const Match &v2) {
-    if (v1.level == v2.level) {
-      return v1.similarityScores > v2.similarityScores;
-    } else {
-      return v1.level > v2.level;
+  it.first->matchId--;
+  it.second->matchId--;
+
+  if (it.first->matchId < -2 || it.second->matchId < -2) {
+    return F;
+  }
+
+#ifdef ENABLE_TIMING
+  auto T1 = std::chrono::high_resolution_clock::now();
+  auto T2 = std::chrono::high_resolution_clock::now();
+  auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+#endif
+
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+
+  ValueToValueMapTy vmap;
+  Function *F_new = CloneFunction(F, vmap);
+  std::string Name = F->getName().str();
+  int SizeOrig = 0;
+  int SizeAfter = 0;
+  DT.recalculate(*F_new);
+  PDT.recalculate(*F_new);
+
+  SizeOrig = EstimateFunctionSize(F, TTI);
+
+  if (!it.first->EntryBlock->getParent() || 
+      !it.first->ExitBlock->getParent() ||
+      !it.second->EntryBlock->getParent() ||
+      !it.second->ExitBlock->getParent()) {
+    F_new->eraseFromParent();
+    return F;
+  }
+
+  BasicBlock *clonedLeftEntry = cast<BasicBlock>(vmap[it.first->EntryBlock]);
+  BasicBlock *clonedLeftExit = cast<BasicBlock>(vmap[it.first->ExitBlock]);
+  BasicBlock *clonedRightEntry = cast<BasicBlock>(vmap[it.second->EntryBlock]);
+  BasicBlock *clonedRightExit = cast<BasicBlock>(vmap[it.second->ExitBlock]);
+
+  Region *RegionL = NULL;
+  Region *RegionR = NULL;
+  ControlFlowGraphInfo CFGInfo(*F_new, DT, PDT, TTI);
+  RegionInfo *RI = CFGInfo.getRegionInfo().get();
+
+  if (clonedLeftEntry && clonedLeftExit) {
+    RegionL = Utils::getRegionWithEntryExit(*RI, clonedLeftEntry,
+                                            clonedLeftExit);
+  }
+
+  if (clonedRightEntry && clonedRightExit) {
+    RegionR = Utils::getRegionWithEntryExit(*RI, clonedRightEntry,
+                                            clonedRightExit);
+  }
+
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  getRegionTime += (unsigned int)(micros);
+#endif
+
+  if (!RegionL || !RegionR) {
+    regionNotExistNum++;
+    F_new->eraseFromParent();
+    return F;
+  }
+
+  RegionL->dump();
+  RegionR->dump();
+
+  RegionComparator RC(RegionL, RegionR);
+  if (!RC.compare()) {
+    F_new->eraseFromParent();
+    return F;
+  }
+
+  if (RegionL->getEntry() == RegionR->getExit() ||
+      RegionL->getExit() == RegionR->getEntry()) {
+    adjacentRegionNum++;
+    F_new->eraseFromParent();
+    return F;
+  }
+
+  // bool bfcase = false;
+  // Region *parent = RI->getCommonRegion(RegionL, RegionR);
+  // if (parent->getEntry()->getTerminator()->getNumSuccessors() == 2) {
+  //   BasicBlock *LeftEntry =
+  //       parent->getEntry()->getTerminator()->getSuccessor(0);
+  //   BasicBlock *RightEntry =
+  //       parent->getEntry()->getTerminator()->getSuccessor(1);
+  //   if (DT.dominates(LeftEntry, RegionL->getEntry()) &&
+  //       PDT.dominates(RegionL->getEntry(), LeftEntry) &&
+  //       DT.dominates(RightEntry, RegionR->getEntry()) &&
+  //       PDT.dominates(RegionR->getEntry(), RightEntry)) {
+  //     bfcase = true;
+  //   } else if (DT.dominates(LeftEntry, RegionR->getEntry()) &&
+  //              PDT.dominates(RegionR->getEntry(), LeftEntry) &&
+  //              DT.dominates(RightEntry, RegionL->getEntry()) &&
+  //              PDT.dominates(RegionL->getEntry(), RightEntry)) {
+  //     bfcase = true;
+  //   }
+  // }
+
+  // if (!enableBfcase && bfcase) {
+  //   return F;
+  // }
+
+  
+
+  SESERegion LeftR(RegionL);
+  SESERegion RightR(RegionR);
+
+  int SizeLeft = 0;
+  int SizeRight = 0;
+
+  std::set<BasicBlock *> KnownBBs;
+  for (BasicBlock &BB : LeftR) {
+    KnownBBs.insert(&BB);
+
+    for (Instruction &I : BB) {
+      auto cost = TTI.getInstructionCost(
+          &I, TargetTransformInfo::TargetCostKind::TCK_CodeSize);
+      SizeLeft += cost.getValue().value();
+      // SizeLeft++;
     }
+  }
+  for (BasicBlock &BB : RightR) {
+    KnownBBs.insert(&BB);
+
+    for (Instruction &I : BB) {
+      auto cost = TTI.getInstructionCost(
+          &I, TargetTransformInfo::TargetCostKind::TCK_CodeSize);
+      SizeRight += cost.getValue().value();
+      // SizeRight++;
+    }
+  }
+
+  bool UseCostInFingerprint = true;
+  AlignmentStats TotalAlignmentStats;
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+  AlignedSequence<Value *> AlignedInsts =
+      FunctionMerger::alignBlocks(LeftR, RightR, TotalAlignmentStats,
+                                  (UseCostInFingerprint ? (&TTI) : nullptr));
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  alignBlocksTime += (unsigned int)(micros);
+#endif
+
+  // for (auto &Entry : AlignedInsts) {
+
+  //   if (true) {
+  //     errs() << "-----------------------------------------------------\n";
+  //     if (Entry.get(0)) {
+  //       if (isa<BasicBlock>(Entry.get(0)))
+  //         errs() << Entry.get(0)->getName() << "\n";
+  //       else
+  //         Entry.get(0)->dump();
+  //     } else
+  //       errs() << "\t-\n";
+  //     if (Entry.get(1)) {
+  //       if (isa<BasicBlock>(Entry.get(1)))
+  //         errs() << Entry.get(1)->getName() << "\n";
+  //       else
+  //         Entry.get(1)->dump();
+  //     } else {
+  //       errs() << "\t-\n";
+  //     }
+  //   }
+  // }
+
+  LLVMContext &Context = F_new->getContext();
+  const DataLayout *DL = &F_new->getParent()->getDataLayout();
+  Type *IntPtrTy = DL->getIntPtrType(Context);
+
+  ValueToValueMapTy VMap;
+  // initialize VMap
+  for (Argument &Arg : F_new->args()) {
+    VMap[&Arg] = &Arg;
+  }
+
+  for (BasicBlock &BB : *F_new) {
+    if (KnownBBs.count(&BB))
+      continue;
+    VMap[&BB] = &BB;
+    for (Instruction &I : BB) {
+      VMap[&I] = &I;
+    }
+  }
+
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+
+  FunctionMergingOptions Options = FunctionMergingOptions()
+                                       .enableUnifiedReturnTypes(false)
+                                       .matchOnlyIdenticalTypes(true);
+
+  BasicBlock *EntryBB = BasicBlock::Create(Context, "rgmEntry", F_new);
+  BasicBlock *LBB = RegionL->getEntry();
+  BasicBlock *RBB = RegionR->getEntry();
+  IRBuilder<> builder(EntryBB);
+  PHINode *labelPhiNode =
+      builder.CreatePHI(Type::getInt1Ty(F_new->getContext()), 2);
+  labelPhiNode->addIncoming(ConstantInt::get(Type::getInt1Ty(Context), 1), LBB);
+  labelPhiNode->addIncoming(ConstantInt::get(Type::getInt1Ty(Context), 0), RBB);
+  FunctionMerger::SALSSACodeGen CG(LeftR.Blocks, RightR.Blocks);
+  CG.insert(labelPhiNode);
+  CG.setFunctionIdentifier(labelPhiNode)
+      .setEntryPoints(LBB, RBB)
+      .setReturnTypes(F_new->getReturnType(), F_new->getReturnType())
+      .setMergedFunction(F_new)
+      .setMergedEntryPoint(EntryBB)
+      .setMergedReturnType(F_new->getReturnType(), false)
+      .setContext(&Context)
+      .setIntPtrType(IntPtrTy);
+  if (!CG.generate(AlignedInsts, VMap, Options)) {
+    errs() << "ERROR: Failed to generate the fused branches!\n";
+    if (Debug) {
+      errs() << "Destroying generated code\n";
+    }
+    CG.destroyGeneratedCode();
+    if (Debug) {
+      errs() << "Generated code destroyed\n";
+    }
+    EntryBB->eraseFromParent();
+    if (Debug) {
+      errs() << "Branch fusion reversed\n";
+    }
+    F_new->eraseFromParent();
+    mergeGenFailNum++;
+    return F;
+  }
+
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  mergeGenTime += (unsigned int)(micros);
+#endif
+
+  std::map<PHINode *, PHINode *> ReplacedPHIs;
+
+  auto ProcessPHIs = [&](auto ExitSet,
+                         std::set<BasicBlock *> &VisitedBB) -> bool {
+    for (BasicBlock &BB : ExitSet) {
+      if (VisitedBB.count(&BB))
+        continue;
+      VisitedBB.insert(&BB);
+
+      auto PHIs = BB.phis();
+
+      for (auto It = PHIs.begin(), E = PHIs.end(); It != E;) {
+        PHINode *PHI = &*It;
+        It++;
+
+        if (Debug) {
+          errs() << "Solving PHI node:";
+          PHI->dump();
+        }
+
+        IRBuilder<> Builder(PHI);
+        PHINode *NewPHI = Builder.CreatePHI(PHI->getType(), 0);
+        CG.insert(NewPHI);
+        VMap[PHI] = NewPHI;
+        ReplacedPHIs[PHI] = NewPHI;
+
+        // Same block can be a predecessor multiple times and can have multiple
+        // incoming edges into BB To keep BB's predecessor information
+        // consistent with the phi incoming values, we need to keep track of the
+        // number of incoming edges from each predecessor block
+        // std::map<BasicBlock *, std::map<BasicBlock *, Value *>> NewEntries;
+        std::map<BasicBlock *, std::map<BasicBlock *, std::pair<Value *, int>>>
+            NewEntries;
+        std::set<BasicBlock *> OldEntries;
+        for (unsigned i = 0; i < PHI->getNumIncomingValues(); i++) {
+          BasicBlock *InBB = PHI->getIncomingBlock(i);
+          if (KnownBBs.count(InBB)) {
+            Value *NewV = PHI->getIncomingValue(i);
+            auto Pair = CG.getNewEdge(InBB, &BB);
+            BasicBlock *NewBB = Pair.first;
+            if (Instruction *OpI =
+                    dyn_cast<Instruction>(PHI->getIncomingValue(i))) {
+              NewV = VMap[OpI];
+
+              if (NewV == nullptr) {
+                errs() << "ERROR: Null mapped value!\n";
+                return false;
+              }
+            }
+            auto result_pair = NewEntries[NewBB].insert({InBB, {NewV, 1}});
+            if (!result_pair.second)
+              result_pair.first->second.second++;
+            // NewEntries[NewBB][InBB] = NewV;
+            OldEntries.insert(InBB);
+          } else {
+            // simply copy incoming values from outside the two regions being
+            // merged
+            NewPHI->addIncoming(PHI->getIncomingValue(i),
+                                PHI->getIncomingBlock(i));
+          }
+        }
+
+        if (Debug) {
+          errs() << "Num entries: " << NewEntries.size() << "\n";
+          for (auto &Pair : NewEntries) {
+            errs() << "Incoming Block: " << Pair.first->getName().str() << "\n";
+            for (auto &Pair2 : Pair.second) {
+              errs() << "Block: " << Pair2.first->getName().str() << " -> ";
+              Pair2.second.first->dump();
+            }
+          }
+        }
+
+        if (Debug) {
+          errs() << "Creating New PHI\n";
+          PHI->dump();
+        }
+        for (auto &Pair : NewEntries) {
+          if (Debug) {
+            errs() << "Incoming Block: " << Pair.first->getName().str() << "\n";
+          }
+          if (Pair.second.size() == 1) {
+            auto &InnerPair = *(Pair.second.begin());
+            Value *V = InnerPair.second.first;
+            int repeats = InnerPair.second.second;
+            for (int i = 0; i < repeats; ++i)
+              NewPHI->addIncoming(V, Pair.first);
+          } else if (Pair.second.size() == 2) {
+            /*
+            Values that were originally coming from different basic blocks that
+            have been merged must be properly handled. In this case, we add a
+            selection in the merged incomming block to produce the correct value
+            for the phi node.
+            */
+            if (Debug) {
+              errs() << "Found  PHI incoming from two different blocks\n";
+            }
+            Value *LeftV = nullptr;
+            Value *RightV = nullptr;
+            int repeats = 0;
+            for (auto &InnerPair : Pair.second) {
+              if (LeftR.contains(InnerPair.first)) {
+                if (Debug) {
+                  errs() << "Value coming from the Left block: "
+                         << GetValueName(InnerPair.first) << " : ";
+                  InnerPair.second.first->dump();
+                }
+                LeftV = InnerPair.second.first;
+              }
+              if (RightR.contains(InnerPair.first)) {
+                if (Debug) {
+                  errs() << "Value coming from the Right block: "
+                         << GetValueName(InnerPair.first) << " : ";
+                  InnerPair.second.first->dump();
+                }
+                RightV = InnerPair.second.first;
+              }
+              repeats = repeats > InnerPair.second.second
+                            ? repeats
+                            : InnerPair.second.second;
+            }
+
+            if (LeftV && RightV) {
+              Value *MergedV = LeftV;
+              if (LeftV != RightV) {
+                IRBuilder<> Builder(Pair.first->getTerminator());
+                // TODO: handle if one of the values is the terminator itself!
+                MergedV = Builder.CreateSelect(labelPhiNode, LeftV, RightV);
+                if (SelectInst *SelI = dyn_cast<SelectInst>(MergedV))
+                  CG.insert(SelI);
+              }
+              for (int i = 0; i < repeats; ++i)
+                NewPHI->addIncoming(MergedV, Pair.first);
+            } else {
+              errs() << "ERROR: THIS IS WEIRD! MAYBE IT SHOULD NOT BE HERE!\n";
+              return false;
+            }
+          } else {
+            errs() << "ERROR: THIS IS WEIRD! MAYBE IT SHOULD NOT BE HERE!\n";
+            return false;
+            /*
+            IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
+            AllocaInst *Addr = Builder.CreateAlloca(PHI->getType());
+            CG.insert(Addr);
+
+            for (Value *V : Pair.second) {
+              if (Instruction *OpI = dyn_cast<Instruction>(V)) {
+                CG.StoreInstIntoAddr(OpI, Addr);
+              } else {
+                errs() << "ERROR: must also handle non-instruction values "
+                          "via a select\n";
+              }
+            }
+
+            Builder.SetInsertPoint(Pair.first->getTerminator());
+            Value *LI = Builder.CreateLoad(PHI->getType(), Addr);
+
+            PHI->addIncoming(LI, Pair.first);
+      */
+          }
+        }
+
+        /*
+        unsigned CountPreds = 0;
+        for (auto It = pred_begin(&BB), E = pred_end(&BB); It != E; It++) {
+          BasicBlock *PredBB = *It;
+
+          if (!LeftR.contains(PredBB) && !RightR.contains(PredBB)) {
+                  CountPreds++;
+                  errs() << "+PredBB: " << PredBB->getName().str() << "\n";
+          } else {
+                  errs() << "-PredBB: " << PredBB->getName().str() << "\n";
+          }
+        }
+        if (CountPreds!=NewPHI->getNumIncomingValues()) {
+                errs() << "ERROR: unexpected number of predecessor\n";
+        }
+        */
+
+        if (Debug) {
+          errs() << "Resulting PHI node:";
+          NewPHI->dump();
+        }
+      }
+    }
+    return true;
   };
 
-  std::sort(matches.begin(), matches.end(), cmp);
-  int i = 0;
-  std::unordered_set<BasicBlock *> ProcessedBBs;
+  bool Error = false;
+
+  std::set<BasicBlock *> VisitedBB;
+  Error = Error || !ProcessPHIs(LeftR.exits(), VisitedBB);
+  Error = Error || !ProcessPHIs(RightR.exits(), VisitedBB);
+
+  if (Debug) {
+    errs() << "Modified function\n";
+  }
+
+  double MergedSize = 0;
+  int rgs = 0;
+  if (Debug) {
+    errs() << "Computing size...\n";
+  }
+  for (Instruction *I : CG) {
+    auto cost = TTI.getInstructionCost(
+        I, TargetTransformInfo::TargetCostKind::TCK_CodeSize);
+    MergedSize += cost.getValue().value();
+    rgs++;
+    // MergedSize++;
+    // errs() << cost.getValue().value() << " ";
+    // I->dump();
+    if (BranchInst *BI = dyn_cast<BranchInst>(I)) {
+      if (BI->isConditional() && BI->getSuccessor(0) == BI->getSuccessor(1)) {
+        MergedSize -= matchArg;
+        rgs--;
+      }
+    } else if (PHINode *BI = dyn_cast<PHINode>(I)) {
+      MergedSize += 0.2;
+    }
+  }
+
+  if (Debug) {
+    errs() << "SizeLeft: " << SizeLeft << "\n";
+    errs() << "SizeRight: " << SizeRight << "\n";
+    errs() << "Original Size: " << (SizeLeft + SizeRight) << "\n";
+    errs() << "New Size: " << MergedSize << "\n";
+  }
+
+  errs() << "SizeDiff: " << (SizeLeft + SizeRight) << " X " << MergedSize
+         << " : " << ((int)(SizeLeft + SizeRight) - ((int)MergedSize)) << " : ";
+
+  bool Profitable = MergedSize < SizeLeft + SizeRight;
+
+  if (Error) {
+    ProcessPHIsErrorNum++;
+  }
+
+  if (!Profitable) {
+    notProfitableLocalNum++;
+    // if (match.similarityScores <= 0.45) {
+    //   int num;
+    //   num =
+    //   readCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileLessFail");
+    //   num++;
+    //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileLessFail",
+    //   num);
+    // }
+    // else {
+    //   int num;
+    //   num =
+    //   readCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreFail");
+    //   num++;
+    //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreFail",
+    //   num);
+    // }
+  }
+
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+
+  if (Error || !Profitable) {
+    if (Debug) {
+      errs() << "Destroying generated code\n";
+    }
+
+    // F.dump();
+    CG.destroyGeneratedCode();
+    if (Debug) {
+      errs() << "Generated code destroyed\n";
+    }
+    EntryBB->eraseFromParent();
+    if (Debug) {
+      errs() << "Branch fusion reversed\n";
+    }
+    F_new->eraseFromParent();
+    return F;
+  }
+
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  resumeCodeTime += (unsigned int)(micros);
+#endif
+
+  std::vector<Instruction *> DeadInsts;
+
+  for (auto &Pair : ReplacedPHIs) {
+    Pair.first->replaceAllUsesWith(Pair.second);
+    Pair.first->dropAllReferences();
+    DeadInsts.push_back(Pair.first);
+  }
+
+  // errs() << "Before deleting the old code\n";
+  // F.dump();
+  for (BasicBlock *BB : KnownBBs) {
+    for (Instruction &I : *BB) {
+      I.replaceAllUsesWith(VMap[&I]);
+
+      I.dropAllReferences();
+      DeadInsts.push_back(&I);
+    }
+  }
+  for (Instruction *I : DeadInsts) {
+    // if (BranchInst *BI = dyn_cast<BranchInst>(I)) {
+    //   ListBIs.remove(BI);
+    // }
+    I->eraseFromParent();
+  }
+  for (BasicBlock *BB : KnownBBs) {
+    if (BB == LBB || BB == RBB)
+      continue;
+    BB->eraseFromParent();
+  }
+
+  builder.SetInsertPoint(LBB);
+  Instruction *NewBrL = builder.CreateBr(EntryBB);
+  builder.SetInsertPoint(RBB);
+  Instruction *NewBrR = builder.CreateBr(EntryBB);
+
+  if (Debug) {
+    errs() << "After deleting the old code\n";
+    // F->dump();
+  }
+  if (!commitChanges(F_new)) {
+    // F.dump();
+    errs() << "ERROR: committing final changes to the fused branches "
+              "!!!!!!!\n";
+    F_new->eraseFromParent();
+    commitChangesErrorNum++;
+    return F;
+  }
+  if (Debug) {
+    errs() << "Final version\n";
+    // F.dump();
+  }
+
+  SimplifyCFGOptions SimplifyCFGOptionsObj;
+
+  simplifyFunction(*F_new, TTI,
+                   SimplifyCFGOptionsObj.setSimplifyCondBranch(false)
+                       .sinkCommonInsts(false)
+                       .hoistCommonInsts(false));
+
+  SizeAfter = EstimateFunctionSize(F_new, TTI);
+
+  if (Debug) {
+    errs() << "*SizeOrig: " << SizeOrig << "\n";
+    errs() << "*SizeAfter: " << SizeAfter << "\n";
+  }
+
+  if (SizeAfter < SizeOrig - matchThreshold && rgs > regionSizeThreshold) {
+    errs() << "RGMSuccess\n";
+    it.first->EntryBlock = clonedLeftEntry;
+    it.first->ExitBlock = clonedLeftExit;
+    it.second->EntryBlock = clonedRightEntry;
+    it.second->ExitBlock = clonedRightExit;
+    F->replaceAllUsesWith(F_new);
+    F->eraseFromParent();
+    F_new->setName(Name);
+    DT.recalculate(*F_new);
+    PDT.recalculate(*F_new);
+    mergeRegionPairsNum++;
+    regionSize += (SizeOrig - SizeAfter) * 100.0 / SizeOrig;
+    // hasBranchFusion = hasBranchFusion || bfcase;
+    // regionSize += MergedSize;
+    // if (match.similarityScores <= 0.45) {
+    //   int num;
+    //   num =
+    //   readCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileLessSucc");
+    //   num++;
+    //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileLessSucc",
+    //   num);
+    // }
+    // else {
+    //   int num;
+    //   num =
+    //   readCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreSucc");
+    //   num++;
+    //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreSucc",
+    //   num);
+    // }
+    return F_new;
+  } else {
+    F_new->eraseFromParent();
+    DT.recalculate(*F);
+    PDT.recalculate(*F);
+    notProfitableGlobalNum++;
+    // if (match.similarityScores <= 0.45) {
+    //   int num;
+    //   num =
+    //   readCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileLessFail");
+    //   num++;
+    //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileLessFail",
+    //   num);
+    // }
+    // else {
+    //   int num;
+    //   num =
+    //   readCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreFail");
+    //   num++;
+    //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreFail",
+    //   num);
+    // }
+    return F;
+  }
+}
+
+static bool runImplCodeSize(Function &F, DominatorTree &DT,
+                            PostDominatorTree &PDT, LoopInfo &LI,
+                            TargetTransformInfo &TTI) {
+  INFO << "Procesing function : " << F.getName() << "\n";
+  Function *Func = &F;
+  bool LocalChange = false, Changed = false;
+
+  int OrigCodeSize = EstimateFunctionSize(&F, TTI);
+  unsigned CountIter = 0;
+
+  do {
+    CountIter++;
+
+    LocalChange = false;
+    for (BasicBlock *BB : post_order(&Func->getEntryBlock())) {
+      if (Utils::isValidMergeLocation(*BB, DT, PDT)) {
+        INFO << "Valid merge location found at block "
+             << BB->getNameOrAsOperand() << "\n";
+        ControlFlowGraphInfo CFGInfo(*Func, DT, PDT, TTI);
+        RegionAnalyzer RA(BB, CFGInfo);
+        RA.computeRegionMatch();
+
+        if (RA.hasAnyProfitableMatch()) {
+
+          // Store the indexes of profitable merges
+          SmallVector<int, 8> Profitable;
+
+          // clone function
+          ValueToValueMapTy VMap;
+          Function *ClonedFunc = CloneFunction(Func, VMap);
+          DominatorTree ClonedDT(*ClonedFunc);
+          PostDominatorTree ClonedPDT(*ClonedFunc);
+          ControlFlowGraphInfo ClonedCFGInfo(*ClonedFunc, ClonedDT, ClonedPDT,
+                                             TTI);
+
+          RegionAnalyzer ClonedRA(dyn_cast<BasicBlock>(VMap[BB]),
+                                  ClonedCFGInfo);
+          ClonedRA.computeRegionMatch();
+
+          for (unsigned I = 0; I < ClonedRA.regionMatchSize(); ++I) {
+            if (!ClonedRA.isRegionMatchProfitable(I))
+              continue;
+
+            int SizeBefore = EstimateFunctionSize(ClonedFunc, TTI);
+            RegionMelder ClonedRM(ClonedRA);
+            ClonedRM.merge(I);
+            int SizeAfter = EstimateFunctionSize(ClonedFunc, TTI);
+            DEBUG << "Size changed from " << SizeBefore << " to " << SizeAfter
+                  << " : " << (SizeBefore - SizeAfter) << " : "
+                  << ((SizeBefore > SizeAfter) ? "Profitable" : "Unprofitable")
+                  << " Branch Fusion! [" << F.getName().str() << "] ";
+            BB->getTerminator()->dump();
+            if (SizeBefore > SizeAfter) {
+              Profitable.push_back(I);
+            }
+          }
+
+          // If there are profitble merges perform them on Func
+          if (!Profitable.empty()) {
+            for (int I : Profitable) {
+              RegionMelder RM(RA);
+              RM.merge(I);
+            }
+            LocalChange = true;
+          }
+
+          // delete the cloned functon
+          ClonedFunc->eraseFromParent();
+
+          if (LocalChange) {
+            DT.recalculate(*Func);
+            PDT.recalculate(*Func);
+            break;
+          }
+        }
+      }
+    }
+
+    Changed |= LocalChange;
+
+  } while (LocalChange); // && CountIter < MaxIterations);
+
+  if (Changed) {
+    // simplifyFunction(
+    //             *Func, TTI,
+    //             SimplifyCFGOptionsObj.setSimplifyCondBranch(false));
+
+    int FinalCodeSize = EstimateFunctionSize(&F, TTI);
+    double PercentReduction =
+        (OrigCodeSize - FinalCodeSize) * 100 / (double)OrigCodeSize;
+    INFO << "Size reduction for function " << F.getName() << ": "
+         << OrigCodeSize << " to  " << FinalCodeSize << " (" << PercentReduction
+         << "%)"
+         << "\n";
+  }
+
+  return Changed;
+}
+
+static void runImpl(Function *F, DominatorTree &DT, PostDominatorTree &PDT,
+                    LoopInfo &LI, TargetTransformInfo &TTI) {
+
+  // if (F->getName() != "MogrifyImageCommand") {
+  //   return;
+  // }
+  // runAnalysisOnly(F, DT, PDT, LI, TTI);
+  std::vector<RegionTree *> regions;
+#ifdef ENABLE_TIMING
+  auto T1 = std::chrono::high_resolution_clock::now();
+  auto T2 = std::chrono::high_resolution_clock::now();
+  auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+#endif
+
+  // runImplCodeSize(*F, DT, PDT, LI, TTI);
+
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+  runRegionMatch(*F, DT, PDT, LI, TTI, regions);
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  runRegionMatchTime += (unsigned int)(micros);
+#endif
+  // melding(F, DT, PDT, LI, TTI);
+  std::vector<Match> matches;
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+  findSimilarRegion(regions, matches);
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  findSimilarRegionTime += (unsigned int)(micros);
+#endif
+#ifdef ENABLE_TIMING
+  T1 = std::chrono::high_resolution_clock::now();
+#endif
+  candidatesRanking(matches);
+#ifdef ENABLE_TIMING
+  T2 = std::chrono::high_resolution_clock::now();
+  micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  candidatesRankingTime += (unsigned int)(micros);
+#endif
+
   for (auto &match : matches) {
     auto it = match.match;
     it.first->getRegion()->dump();
@@ -698,488 +1556,36 @@ static void runImpl(Function &F, DominatorTree &DT, PostDominatorTree &PDT,
     errs() << "============\n";
   }
 
+  // matchedRegionPairsNum += matches.size();
+
+  int i = 0;
   for (auto &match : matches) {
-    // if (i++ != 12)
-    //   continue;
-    auto it = match.match;
-    Region *RegionL = it.first->getRegion();
-    Region *RegionR = it.second->getRegion();
-
-    bool Processed = false;
-    for (auto i : it.first->getBlocks()) {
-      if (ProcessedBBs.find(i) != ProcessedBBs.end()) {
-        Processed = true;
-        break;
-      }
-    }
-    for (auto i : it.second->getBlocks()) {
-      if (ProcessedBBs.find(i) != ProcessedBBs.end()) {
-        Processed = true;
-        break;
-      }
-    }
-
-    if (Processed)
-      continue;
-
-    if (RegionL->getEntry() == RegionR->getExit() ||
-        RegionL->getExit() == RegionR->getEntry()) {
-      continue;
-    }
-
-    // if (!RegionL->isSimple()) {
-    //   continue;
-    // }
-    // if (!RegionR->isSimple()) {
-    //   continue;
-    // }
-
-    RegionL->dump();
-    errs() << "------------\n";
-    RegionR->dump();
-    errs() << "============\n";
-
-    RegionComparator RC(RegionL, RegionR);
-    RC.compare();
-    std::shared_ptr<MergeableRegionPair> regionPair =
-        std::make_shared<MergeableRegionPair>(*RegionL, *RegionR, RC);
-    // errs() << "Regions are similar\n";
-    //   errs() << *regionPair << "\n";
-    //   errs() << "Similarity score is " << regionPair->getSimilarityScore()
-    //         << "\n";
-    if (regionPair->getSimilarityScore() < 0.3)
-      continue;
-
-    SESERegion LeftR(RegionL);
-    SESERegion RightR(RegionR);
-
-    int SizeLeft = 0;
-    int SizeRight = 0;
-
-    TargetTransformInfo TTI(F.getParent()->getDataLayout());
-
-    std::set<BasicBlock *> KnownBBs;
-    for (BasicBlock &BB : LeftR) {
-      KnownBBs.insert(&BB);
-
-      for (Instruction &I : BB) {
-        auto cost = TTI.getInstructionCost(
-            &I, TargetTransformInfo::TargetCostKind::TCK_CodeSize);
-        SizeLeft += cost.getValue().value();
-      }
-    }
-    for (BasicBlock &BB : RightR) {
-      KnownBBs.insert(&BB);
-
-      for (Instruction &I : BB) {
-        auto cost = TTI.getInstructionCost(
-            &I, TargetTransformInfo::TargetCostKind::TCK_CodeSize);
-        SizeRight += cost.getValue().value();
-      }
-    }
-
-    bool UseCostInFingerprint = true;
-    AlignmentStats TotalAlignmentStats;
-    AlignedSequence<Value *> AlignedInsts =
-        FunctionMerger::alignBlocks(LeftR, RightR, TotalAlignmentStats,
-                                    (UseCostInFingerprint ? (&TTI) : nullptr));
-
-    for (auto &Entry : AlignedInsts) {
-
-      if (true) {
-        errs() << "-----------------------------------------------------\n";
-        if (Entry.get(0)) {
-          if (isa<BasicBlock>(Entry.get(0)))
-            errs() << Entry.get(0)->getName() << "\n";
-          else
-            Entry.get(0)->dump();
-        } else
-          errs() << "\t-\n";
-        if (Entry.get(1)) {
-          if (isa<BasicBlock>(Entry.get(1)))
-            errs() << Entry.get(1)->getName() << "\n";
-          else
-            Entry.get(1)->dump();
-        } else {
-          errs() << "\t-\n";
-        }
-      }
-    }
-
-    LLVMContext &Context = F.getContext();
-    const DataLayout *DL = &F.getParent()->getDataLayout();
-    Type *IntPtrTy = DL->getIntPtrType(Context);
-
-    ValueToValueMapTy VMap;
-    // initialize VMap
-    for (Argument &Arg : F.args()) {
-      VMap[&Arg] = &Arg;
-    }
-
-    for (BasicBlock &BB : F) {
-      if (KnownBBs.count(&BB))
-        continue;
-      VMap[&BB] = &BB;
-      for (Instruction &I : BB) {
-        VMap[&I] = &I;
-      }
-    }
-
-    FunctionMergingOptions Options = FunctionMergingOptions()
-                                         .enableUnifiedReturnTypes(false)
-                                         .matchOnlyIdenticalTypes(true);
-
-    BasicBlock *EntryBB = BasicBlock::Create(Context, "rgmEntry", &F);
-    BasicBlock *LBB = RegionL->getEntry();
-    BasicBlock *RBB = RegionR->getEntry();
-    IRBuilder<> builder(EntryBB);
-    PHINode *labelPhiNode =
-        builder.CreatePHI(Type::getInt1Ty(F.getContext()), 2);
-    labelPhiNode->addIncoming(ConstantInt::get(Type::getInt1Ty(Context), 1),
-                              LBB);
-    labelPhiNode->addIncoming(ConstantInt::get(Type::getInt1Ty(Context), 0),
-                              RBB);
-    FunctionMerger::SALSSACodeGen CG(LeftR.Blocks, RightR.Blocks);
-    CG.insert(labelPhiNode);
-    CG.setFunctionIdentifier(labelPhiNode)
-        .setEntryPoints(LBB, RBB)
-        .setReturnTypes(F.getReturnType(), F.getReturnType())
-        .setMergedFunction(&F)
-        .setMergedEntryPoint(EntryBB)
-        .setMergedReturnType(F.getReturnType(), false)
-        .setContext(&Context)
-        .setIntPtrType(IntPtrTy);
-    if (!CG.generate(AlignedInsts, VMap, Options)) {
-      errs() << "ERROR: Failed to generate the fused branches!\n";
-      if (Debug) {
-        errs() << "Destroying generated code\n";
-      }
-      CG.destroyGeneratedCode();
-      if (Debug) {
-        errs() << "Generated code destroyed\n";
-      }
-      EntryBB->eraseFromParent();
-      if (Debug) {
-        errs() << "Branch fusion reversed\n";
-      }
-      continue;
-    }
-
-    std::map<PHINode *, PHINode *> ReplacedPHIs;
-
-    auto ProcessPHIs = [&](auto ExitSet,
-                           std::set<BasicBlock *> &VisitedBB) -> bool {
-      for (BasicBlock &BB : ExitSet) {
-        if (VisitedBB.count(&BB))
-          continue;
-        VisitedBB.insert(&BB);
-
-        auto PHIs = BB.phis();
-
-        for (auto It = PHIs.begin(), E = PHIs.end(); It != E;) {
-          PHINode *PHI = &*It;
-          It++;
-
-          if (Debug) {
-            errs() << "Solving PHI node:";
-            PHI->dump();
-          }
-
-          IRBuilder<> Builder(PHI);
-          PHINode *NewPHI = Builder.CreatePHI(PHI->getType(), 0);
-          CG.insert(NewPHI);
-          VMap[PHI] = NewPHI;
-          ReplacedPHIs[PHI] = NewPHI;
-
-          // Same block can be a predecessor multiple times and can have
-          // multiple incoming edges into BB To keep BB's predecessor
-          // information consistent with the phi incoming values, we need to
-          // keep track of the number of incoming edges from each predecessor
-          // block
-          // std::map<BasicBlock *, std::map<BasicBlock *, Value *>>
-          // NewEntries;
-          std::map<BasicBlock *,
-                   std::map<BasicBlock *, std::pair<Value *, int>>>
-              NewEntries;
-          std::set<BasicBlock *> OldEntries;
-          for (unsigned i = 0; i < PHI->getNumIncomingValues(); i++) {
-            BasicBlock *InBB = PHI->getIncomingBlock(i);
-            if (KnownBBs.count(InBB)) {
-              Value *NewV = PHI->getIncomingValue(i);
-              auto Pair = CG.getNewEdge(InBB, &BB);
-              BasicBlock *NewBB = Pair.first;
-              if (Instruction *OpI =
-                      dyn_cast<Instruction>(PHI->getIncomingValue(i))) {
-                NewV = VMap[OpI];
-
-                if (NewV == nullptr) {
-                  errs() << "ERROR: Null mapped value!\n";
-                  return false;
-                }
-              }
-              auto result_pair = NewEntries[NewBB].insert({InBB, {NewV, 1}});
-              if (!result_pair.second)
-                result_pair.first->second.second++;
-              // NewEntries[NewBB][InBB] = NewV;
-              OldEntries.insert(InBB);
-            } else {
-              // simply copy incoming values from outside the two regions
-              // being merged
-              NewPHI->addIncoming(PHI->getIncomingValue(i),
-                                  PHI->getIncomingBlock(i));
-            }
-          }
-
-          if (Debug) {
-            errs() << "Num entries: " << NewEntries.size() << "\n";
-            for (auto &Pair : NewEntries) {
-              errs() << "Incoming Block: " << Pair.first->getName().str()
-                     << "\n";
-              for (auto &Pair2 : Pair.second) {
-                errs() << "Block: " << Pair2.first->getName().str() << " -> ";
-                Pair2.second.first->dump();
-              }
-            }
-          }
-
-          if (Debug) {
-            errs() << "Creating New PHI\n";
-            PHI->dump();
-          }
-          for (auto &Pair : NewEntries) {
-            if (Debug) {
-              errs() << "Incoming Block: " << Pair.first->getName().str()
-                     << "\n";
-            }
-            if (Pair.second.size() == 1) {
-              auto &InnerPair = *(Pair.second.begin());
-              Value *V = InnerPair.second.first;
-              int repeats = InnerPair.second.second;
-              for (int i = 0; i < repeats; ++i)
-                NewPHI->addIncoming(V, Pair.first);
-            } else if (Pair.second.size() == 2) {
-              /*
-              Values that were originally coming from different basic blocks
-              that have been merged must be properly handled. In this case, we
-              add a selection in the merged incomming block to produce the
-              correct value for the phi node.
-              */
-              if (Debug) {
-                errs() << "Found  PHI incoming from two different blocks\n";
-              }
-              Value *LeftV = nullptr;
-              Value *RightV = nullptr;
-              int repeats = 0;
-              for (auto &InnerPair : Pair.second) {
-                if (LeftR.contains(InnerPair.first)) {
-                  if (Debug) {
-                    errs() << "Value coming from the Left block: "
-                           << GetValueName(InnerPair.first) << " : ";
-                    InnerPair.second.first->dump();
-                  }
-                  LeftV = InnerPair.second.first;
-                }
-                if (RightR.contains(InnerPair.first)) {
-                  if (Debug) {
-                    errs() << "Value coming from the Right block: "
-                           << GetValueName(InnerPair.first) << " : ";
-                    InnerPair.second.first->dump();
-                  }
-                  RightV = InnerPair.second.first;
-                }
-                repeats = repeats > InnerPair.second.second
-                              ? repeats
-                              : InnerPair.second.second;
-              }
-
-              if (LeftV && RightV) {
-                Value *MergedV = LeftV;
-                if (LeftV != RightV) {
-                  IRBuilder<> Builder(Pair.first->getTerminator());
-                  // TODO: handle if one of the values is the terminator
-                  // itself!
-                  MergedV = Builder.CreateSelect(labelPhiNode, LeftV, RightV);
-                  if (SelectInst *SelI = dyn_cast<SelectInst>(MergedV))
-                    CG.insert(SelI);
-                }
-                for (int i = 0; i < repeats; ++i)
-                  NewPHI->addIncoming(MergedV, Pair.first);
-              } else {
-                errs()
-                    << "ERROR: THIS IS WEIRD! MAYBE IT SHOULD NOT BE HERE!\n";
-                return false;
-              }
-            } else {
-              errs() << "ERROR: THIS IS WEIRD! MAYBE IT SHOULD NOT BE HERE!\n";
-              return false;
-              /*
-              IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
-              AllocaInst *Addr = Builder.CreateAlloca(PHI->getType());
-              CG.insert(Addr);
-
-              for (Value *V : Pair.second) {
-                if (Instruction *OpI = dyn_cast<Instruction>(V)) {
-                  CG.StoreInstIntoAddr(OpI, Addr);
-                } else {
-                  errs() << "ERROR: must also handle non-instruction values "
-                            "via a select\n";
-                }
-              }
-
-              Builder.SetInsertPoint(Pair.first->getTerminator());
-              Value *LI = Builder.CreateLoad(PHI->getType(), Addr);
-
-              PHI->addIncoming(LI, Pair.first);
-        */
-            }
-          }
-
-          /*
-          unsigned CountPreds = 0;
-          for (auto It = pred_begin(&BB), E = pred_end(&BB); It != E; It++) {
-            BasicBlock *PredBB = *It;
-
-            if (!LeftR.contains(PredBB) && !RightR.contains(PredBB)) {
-                    CountPreds++;
-                    errs() << "+PredBB: " << PredBB->getName().str() << "\n";
-            } else {
-                    errs() << "-PredBB: " << PredBB->getName().str() << "\n";
-            }
-          }
-          if (CountPreds!=NewPHI->getNumIncomingValues()) {
-                  errs() << "ERROR: unexpected number of predecessor\n";
-          }
-          */
-
-          if (Debug) {
-            errs() << "Resulting PHI node:";
-            NewPHI->dump();
-          }
-        }
-      }
-      return true;
-    };
-
-    bool Error = false;
-
-    std::set<BasicBlock *> VisitedBB;
-    Error = Error || !ProcessPHIs(LeftR.exits(), VisitedBB);
-    Error = Error || !ProcessPHIs(RightR.exits(), VisitedBB);
-    errs() << Error << '\n';
-
-    if (Debug) {
-      errs() << "Modified function\n";
-    }
-
-    int MergedSize = 0;
-    if (Debug) {
-      errs() << "Computing size...\n";
-    }
-    for (Instruction *I : CG) {
-      auto cost = TTI.getInstructionCost(
-          I, TargetTransformInfo::TargetCostKind::TCK_CodeSize);
-      MergedSize += cost.getValue().value();
-    }
-
-    if (Debug) {
-      errs() << "SizeLeft: " << SizeLeft << "\n";
-      errs() << "SizeRight: " << SizeRight << "\n";
-      errs() << "Original Size: " << (SizeLeft + SizeRight) << "\n";
-      errs() << "New Size: " << MergedSize << "\n";
-    }
-
-    errs() << "SizeDiff: " << (SizeLeft + SizeRight) << " X " << MergedSize
-           << " : " << ((int)(SizeLeft + SizeRight) - ((int)MergedSize))
-           << " : ";
-
-    bool Profitable = MergedSize < SizeLeft + SizeRight;
-
-    if (Error || !Profitable) {
-      if (Debug) {
-        errs() << "Destroying generated code\n";
-      }
-
-      // F.dump();
-      CG.destroyGeneratedCode();
-      if (Debug) {
-        errs() << "Generated code destroyed\n";
-      }
-      EntryBB->eraseFromParent();
-      if (Debug) {
-        errs() << "Branch fusion reversed\n";
-      }
-
-      continue;
-    }
-
-    std::vector<Instruction *> DeadInsts;
-
-    for (auto &Pair : ReplacedPHIs) {
-      Pair.first->replaceAllUsesWith(Pair.second);
-      Pair.first->dropAllReferences();
-      DeadInsts.push_back(Pair.first);
-    }
-
-    // errs() << "Before deleting the old code\n";
-    // F.dump();
-    for (BasicBlock *BB : KnownBBs) {
-      for (Instruction &I : *BB) {
-        I.replaceAllUsesWith(VMap[&I]);
-
-        I.dropAllReferences();
-        DeadInsts.push_back(&I);
-      }
-    }
-    for (Instruction *I : DeadInsts) {
-      // if (BranchInst *BI = dyn_cast<BranchInst>(I)) {
-      //   ListBIs.remove(BI);
-      // }
-      I->eraseFromParent();
-    }
-    for (BasicBlock *BB : KnownBBs) {
-      if (BB == LBB || BB == RBB)
-        continue;
-      BB->eraseFromParent();
-    }
-
-    for (BasicBlock *BB : it.first->getBlocks()) {
-      ProcessedBBs.insert(BB);
-    }
-    for (BasicBlock *BB : it.second->getBlocks()) {
-      ProcessedBBs.insert(BB);
-    }
-
-    builder.SetInsertPoint(LBB);
-    Instruction *NewBrL = builder.CreateBr(EntryBB);
-    builder.SetInsertPoint(RBB);
-    Instruction *NewBrR = builder.CreateBr(EntryBB);
-
-    if (Debug) {
-      errs() << "After deleting the old code\n";
-      // F.dump();
-    }
-    if (!commitChanges(F)) {
-      // F.dump();
-      errs() << "ERROR: committing final changes to the fused branches "
-                "!!!!!!!\n";
-    }
-    if (Debug) {
-      errs() << "Final version\n";
-      // F.dump();
-    }
-    // break;
-    DT.recalculate(F);
-    PDT.recalculate(F);
+    if (i++ > matches.size() * matchRatio)
+      break;
+    // if (i++ > 20)
+    //   break;
+    errs() << "similarityScores: " << match.similarityScores << '\n';
+    matchedRegionPairsNum++;
+#ifdef ENABLE_TIMING
+    T1 = std::chrono::high_resolution_clock::now();
+#endif
+    F = regionMerging(F, DT, PDT, LI, TTI, match);
+#ifdef ENABLE_TIMING
+    T2 = std::chrono::high_resolution_clock::now();
+    micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+    regionMergingTime += (unsigned int)(micros);
+#endif
   }
-  SimplifyCFGOptions SimplifyCFGOptionsObj;
-  FunctionPassManager FPM;
-  if (simplifyFunction(F, TTI,
-                       SimplifyCFGOptionsObj.setSimplifyCondBranch(false)
-                           .sinkCommonInsts(false)
-                           .hoistCommonInsts(false))) {
-    DT.recalculate(F);
-    PDT.recalculate(F);
-  }
+  // SimplifyCFGOptions SimplifyCFGOptionsObj;
+  // FunctionPassManager FPM;
+  // if (simplifyFunction(*F, TTI,
+  //                      SimplifyCFGOptionsObj.setSimplifyCondBranch(false)
+  //                          .sinkCommonInsts(false)
+  //                          .hoistCommonInsts(false))) {
+  //   DT.recalculate(*F);
+  //   PDT.recalculate(*F);
+  // }
 }
 
 PreservedAnalyses RegionMergingPass::run(Function &F,
@@ -1191,15 +1597,17 @@ PreservedAnalyses RegionMergingPass::run(Function &F,
   auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
   auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-  runImpl(F, DT, PDT, LI, TTI);
+  runImpl(&F, DT, PDT, LI, TTI);
 
   return PreservedAnalyses::none();
 }
 
 PreservedAnalyses RegionMergingModulePass::run(Module &M,
-                                                 ModuleAnalysisManager &MAM) {
+                                               ModuleAnalysisManager &MAM) {
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   SmallVector<Function *, 64> Funcs;
+
+  hasBranchFusion = false;
 
   for (auto &F : M) {
     if (F.isDeclaration())
@@ -1213,20 +1621,60 @@ PreservedAnalyses RegionMergingModulePass::run(Module &M,
     auto &PDT = FAM.getResult<PostDominatorTreeAnalysis>(*F);
     auto &TTI = FAM.getResult<TargetIRAnalysis>(*F);
     auto &LI = FAM.getResult<LoopAnalysis>(*F);
-    runImpl(*F, DT, PDT, LI, TTI);
+
+#ifdef ENABLE_TIMING
+    auto T1 = std::chrono::high_resolution_clock::now();
+#endif
+    runImpl(F, DT, PDT, LI, TTI);
+#ifdef ENABLE_TIMING
+    auto T2 = std::chrono::high_resolution_clock::now();
+    auto micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+    allTime += (unsigned int)(micros);
+#endif
+    // ValueToValueMapTy vmap;
+    // Function *F_clone = CloneFunction(F, vmap);
+    // for (auto it : vmap) {
+    //   it.first->dump();
+    //   errs() << "-----------\n";
+    //   it.second->dump();
+    //   errs() << "===========\n";
+    // }
+    // F->replaceAllUsesWith(F_clone);
+    // std::string Name = F->getName().str();
+    // F->eraseFromParent();
+    // F_clone->setName(Name);
+    // break;
   }
   return PreservedAnalyses::none();
 }
 
+// extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+// llvmGetPassPluginInfo() {
+//   return {LLVM_PLUGIN_API_VERSION, "RegionMergingPass",
+//   "LLVM_VERSION_STRING",
+//           [](PassBuilder &PB) {
+//             PB.registerPipelineParsingCallback(
+//                 [](StringRef PassName, FunctionPassManager &FPM,
+//                    ArrayRef<PassBuilder::PipelineElement>) {
+//                   if (PassName == "rgm") {
+//                     FPM.addPass(RegionMergingPass());
+//                     return true;
+//                   }
+//                   return false;
+//                 });
+//           }};
+// }
+
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "RegionMergingPass", "LLVM_VERSION_STRING",
-          [](PassBuilder &PB) {
+  return {LLVM_PLUGIN_API_VERSION, "RegionMergingModulePass",
+          "LLVM_VERSION_STRING", [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
-                [](StringRef PassName, FunctionPassManager &FPM,
+                [](StringRef PassName, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (PassName == "rgm") {
-                    FPM.addPass(RegionMergingPass());
+                    MPM.addPass(RegionMergingModulePass());
                     return true;
                   }
                   return false;

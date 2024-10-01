@@ -62,12 +62,16 @@ public:
   static std::pair<unsigned, unsigned>
   computeLatReductionAtBest(BasicBlock *BB1, BasicBlock *BB2);
 
+  static std::pair<unsigned, unsigned> computeSimilarityLCS(BasicBlock *BB1,
+                                                            BasicBlock *BB2);
+
   /// Compute the similarity score for two blocks
   static double computeBlockSimilarity(BasicBlock *BB1, BasicBlock *BB2);
 
   /// Compute block similarity with region replication
   static double computeBlockSimilarity(BasicBlock *BB1, BasicBlock *BB2,
-                                       Region *Replicated, function_ref<int()> GetBrCost);
+                                       Region *Replicated,
+                                       function_ref<int()> GetBrCost);
 
   /// Computes the similarity score for two regions given by 'Mapping'
   static double

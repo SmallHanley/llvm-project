@@ -9,10 +9,17 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/GraphWriter.h"
+#include "llvm/Support/raw_ostream.h"
 #include <sstream>
 using namespace llvm;
+
+#define DEBUG_TYPE "CFMelderUtils"
+#define ENABLE_TIMING
+
+STATISTIC(computeSimilarityTime, "Time spent in compute similarity in microseconds");
+STATISTIC(regionNum, "The # of regions to compute");
+STATISTIC(regionSize, "The size of region");
 
 bool Utils::requireRegionSimplification(Region *R) {
   BasicBlock *Exit = R->getExit();
@@ -132,20 +139,29 @@ Utils::computeLatReductionAtBest(BasicBlock *BB1, BasicBlock *BB2) {
   DenseMap<unsigned, std::pair<unsigned, unsigned>> FreqMap;
   unsigned LatReducedAtBest = 0;
   unsigned TotalLatency = 0;
+
+#ifdef ENABLE_TIMING
+  auto T1 = std::chrono::high_resolution_clock::now();
+#endif
+
   for (auto It = BB1->begin(); It != BB1->end(); ++It) {
     if (FreqMap.find(It->getOpcode()) == FreqMap.end())
       FreqMap[It->getOpcode()] = std::make_pair(0, 0);
 
-    FreqMap[It->getOpcode()].first += Utils::getInstructionCost(&(*It));
-    TotalLatency += Utils::getInstructionCost(&(*It));
+    // FreqMap[It->getOpcode()].first += Utils::getInstructionCost(&(*It));
+    // TotalLatency += Utils::getInstructionCost(&(*It));
+    FreqMap[It->getOpcode()].first++;
+    TotalLatency++;
   }
 
   for (auto It = BB2->begin(); It != BB2->end(); ++It) {
     if (FreqMap.find(It->getOpcode()) == FreqMap.end())
       FreqMap[It->getOpcode()] = std::make_pair(0, 0);
 
-    FreqMap[It->getOpcode()].second += Utils::getInstructionCost(&(*It));
-    TotalLatency += Utils::getInstructionCost(&(*It));
+    // FreqMap[It->getOpcode()].second += Utils::getInstructionCost(&(*It));
+    // TotalLatency += Utils::getInstructionCost(&(*It));
+    FreqMap[It->getOpcode()].second++;
+    TotalLatency++;
   }
 
   for (auto It : FreqMap) {
@@ -158,7 +174,61 @@ Utils::computeLatReductionAtBest(BasicBlock *BB1, BasicBlock *BB2) {
     LatReducedAtBest += std::min(Counts.first, Counts.second);
   }
 
+#ifdef ENABLE_TIMING
+  auto T2 = std::chrono::high_resolution_clock::now();
+  auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  computeSimilarityTime += (unsigned int)(micros);
+#endif
+
+  regionNum++;
+  regionSize += TotalLatency;
+
   return std::pair<unsigned, unsigned>(LatReducedAtBest, TotalLatency);
+}
+
+std::pair<unsigned, unsigned> Utils::computeSimilarityLCS(BasicBlock *BB1,
+                                                   BasicBlock *BB2) {
+  std::vector<int> op1;
+  std::vector<int> op2;
+
+#ifdef ENABLE_TIMING
+  auto T1 = std::chrono::high_resolution_clock::now();
+#endif
+
+  for (auto It = BB1->begin(); It != BB1->end(); ++It) {
+    op1.push_back(It->getOpcode());
+  }
+
+  for (auto It = BB2->begin(); It != BB2->end(); ++It) {
+    op2.push_back(It->getOpcode());
+  }
+
+  int sz1 = op1.size();
+  int sz2 = op2.size();
+  std::vector<std::vector<int>> dp(sz1 + 1, std::vector<int>(sz2 + 1));
+
+  for (int i = 1; i <= sz1; i++) {
+    for (int j = 1; j <= sz2; j++) {
+      if (op1[i - 1] == op2[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = std::max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+#ifdef ENABLE_TIMING
+  auto T2 = std::chrono::high_resolution_clock::now();
+  auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(T2 - T1).count();
+  computeSimilarityTime += (unsigned int)(micros);
+#endif
+
+  regionNum++;
+  regionSize += sz1 + sz2;
+
+  return std::pair<unsigned, unsigned>(dp[sz1][sz2], sz1 + sz2);
 }
 
 double Utils::computeBlockSimilarity(BasicBlock *BB1, BasicBlock *BB2) {
@@ -179,12 +249,13 @@ double Utils::computeBlockSimilarity(BasicBlock *BB1, BasicBlock *BB2,
   int LatReductionAtBest = 0, TotalLatency = 0;
   // iterate over all blocks in replicated region
   for (auto *BB : Replicated->blocks()) {
-    // for the matched blocks compute the instructions that can merged in best case
+    // for the matched blocks compute the instructions that can merged in best
+    // case
     if (BB == BB1 || BB == BB2) {
       auto LatInfo = computeLatReductionAtBest(BB1, BB2);
       LatReductionAtBest += LatInfo.first;
       TotalLatency += LatInfo.second;
-    } 
+    }
     // else you have to pay one more branch to execute the block conditionally
     else {
       for (Instruction &I : *BB) {
@@ -204,7 +275,8 @@ double Utils::computeRegionSimilarity(
     // exit is not melded, ignore it's profitablity
     if (It.first == LExit)
       continue;
-    auto LatInfo = computeLatReductionAtBest(It.first, It.second);
+    // auto LatInfo = computeLatReductionAtBest(It.first, It.second);
+    auto LatInfo = computeSimilarityLCS(It.first, It.second);
 
     // NMergeableAtBest += computeMaxNumMergeableInsts(It.first, It.second);
     // TotalInsts += (unsigned)(It.first->size() + It.second->size());
@@ -241,7 +313,7 @@ int Utils::getInstructionCost(Instruction *I) {
   //   SavedCycles = 100;
   //   break;
   default:
-    SavedCycles = 3;
+    SavedCycles = 1;
     break;
   }
   return SavedCycles;
