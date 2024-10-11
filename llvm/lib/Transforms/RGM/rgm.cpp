@@ -63,6 +63,7 @@ STATISTIC(resumeCodeTime, "Time spent in resuming code in microseconds");
 STATISTIC(allTime, "Time spent totally in microseconds");
 STATISTIC(regionSize, "The region size");
 STATISTIC(hasBranchFusion, "Check has branch fusion");
+STATISTIC(llvmSize, "Count LLVM size");
 
 static cl::opt<double> scoreThreshold("rgm-score-threshold", cl::init(0.35),
                                       cl::Hidden,
@@ -754,42 +755,19 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
   T1 = std::chrono::high_resolution_clock::now();
 #endif
 
-  ValueToValueMapTy vmap;
-  Function *F_new = CloneFunction(F, vmap);
-  std::string Name = F->getName().str();
-  int SizeOrig = 0;
-  int SizeAfter = 0;
-  DT.recalculate(*F_new);
-  PDT.recalculate(*F_new);
-
-  SizeOrig = EstimateFunctionSize(F, TTI);
-
-  if (!it.first->EntryBlock->getParent() || 
-      !it.first->ExitBlock->getParent() ||
-      !it.second->EntryBlock->getParent() ||
-      !it.second->ExitBlock->getParent()) {
-    F_new->eraseFromParent();
-    return F;
-  }
-
-  BasicBlock *clonedLeftEntry = cast<BasicBlock>(vmap[it.first->EntryBlock]);
-  BasicBlock *clonedLeftExit = cast<BasicBlock>(vmap[it.first->ExitBlock]);
-  BasicBlock *clonedRightEntry = cast<BasicBlock>(vmap[it.second->EntryBlock]);
-  BasicBlock *clonedRightExit = cast<BasicBlock>(vmap[it.second->ExitBlock]);
-
   Region *RegionL = NULL;
   Region *RegionR = NULL;
-  ControlFlowGraphInfo CFGInfo(*F_new, DT, PDT, TTI);
+  ControlFlowGraphInfo CFGInfo(*F, DT, PDT, TTI);
   RegionInfo *RI = CFGInfo.getRegionInfo().get();
 
-  if (clonedLeftEntry && clonedLeftExit) {
-    RegionL = Utils::getRegionWithEntryExit(*RI, clonedLeftEntry,
-                                            clonedLeftExit);
+  if (it.first->EntryBlock && it.first->ExitBlock) {
+    RegionL = Utils::getRegionWithEntryExit(*RI, it.first->EntryBlock,
+                                            it.first->ExitBlock);
   }
 
-  if (clonedRightEntry && clonedRightExit) {
-    RegionR = Utils::getRegionWithEntryExit(*RI, clonedRightEntry,
-                                            clonedRightExit);
+  if (it.second->EntryBlock && it.second->ExitBlock) {
+    RegionR = Utils::getRegionWithEntryExit(*RI, it.second->EntryBlock,
+                                            it.second->ExitBlock);
   }
 
 #ifdef ENABLE_TIMING
@@ -801,7 +779,6 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
 
   if (!RegionL || !RegionR) {
     regionNotExistNum++;
-    F_new->eraseFromParent();
     return F;
   }
 
@@ -810,14 +787,12 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
 
   RegionComparator RC(RegionL, RegionR);
   if (!RC.compare()) {
-    F_new->eraseFromParent();
     return F;
   }
 
   if (RegionL->getEntry() == RegionR->getExit() ||
       RegionL->getExit() == RegionR->getEntry()) {
     adjacentRegionNum++;
-    F_new->eraseFromParent();
     return F;
   }
 
@@ -845,7 +820,18 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
   //   return F;
   // }
 
-  
+  ValueToValueMapTy vmap;
+  Function *F_orig = CloneFunction(F, vmap);
+  std::string Name = F->getName().str();
+  int SizeOrig = 0;
+  int SizeAfter = 0;
+
+  SizeOrig = EstimateFunctionSize(F_orig, TTI);
+
+  BasicBlock *clonedLeftEntry = cast<BasicBlock>(vmap[it.first->EntryBlock]);
+  BasicBlock *clonedLeftExit = cast<BasicBlock>(vmap[it.first->ExitBlock]);
+  BasicBlock *clonedRightEntry = cast<BasicBlock>(vmap[it.second->EntryBlock]);
+  BasicBlock *clonedRightExit = cast<BasicBlock>(vmap[it.second->ExitBlock]);
 
   SESERegion LeftR(RegionL);
   SESERegion RightR(RegionR);
@@ -912,17 +898,17 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
   //   }
   // }
 
-  LLVMContext &Context = F_new->getContext();
-  const DataLayout *DL = &F_new->getParent()->getDataLayout();
+  LLVMContext &Context = F->getContext();
+  const DataLayout *DL = &F->getParent()->getDataLayout();
   Type *IntPtrTy = DL->getIntPtrType(Context);
 
   ValueToValueMapTy VMap;
   // initialize VMap
-  for (Argument &Arg : F_new->args()) {
+  for (Argument &Arg : F->args()) {
     VMap[&Arg] = &Arg;
   }
 
-  for (BasicBlock &BB : *F_new) {
+  for (BasicBlock &BB : *F) {
     if (KnownBBs.count(&BB))
       continue;
     VMap[&BB] = &BB;
@@ -939,22 +925,22 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
                                        .enableUnifiedReturnTypes(false)
                                        .matchOnlyIdenticalTypes(true);
 
-  BasicBlock *EntryBB = BasicBlock::Create(Context, "rgmEntry", F_new);
+  BasicBlock *EntryBB = BasicBlock::Create(Context, "rgmEntry", F);
   BasicBlock *LBB = RegionL->getEntry();
   BasicBlock *RBB = RegionR->getEntry();
   IRBuilder<> builder(EntryBB);
   PHINode *labelPhiNode =
-      builder.CreatePHI(Type::getInt1Ty(F_new->getContext()), 2);
+      builder.CreatePHI(Type::getInt1Ty(F->getContext()), 2);
   labelPhiNode->addIncoming(ConstantInt::get(Type::getInt1Ty(Context), 1), LBB);
   labelPhiNode->addIncoming(ConstantInt::get(Type::getInt1Ty(Context), 0), RBB);
   FunctionMerger::SALSSACodeGen CG(LeftR.Blocks, RightR.Blocks);
   CG.insert(labelPhiNode);
   CG.setFunctionIdentifier(labelPhiNode)
       .setEntryPoints(LBB, RBB)
-      .setReturnTypes(F_new->getReturnType(), F_new->getReturnType())
-      .setMergedFunction(F_new)
+      .setReturnTypes(F->getReturnType(), F->getReturnType())
+      .setMergedFunction(F)
       .setMergedEntryPoint(EntryBB)
-      .setMergedReturnType(F_new->getReturnType(), false)
+      .setMergedReturnType(F->getReturnType(), false)
       .setContext(&Context)
       .setIntPtrType(IntPtrTy);
   if (!CG.generate(AlignedInsts, VMap, Options)) {
@@ -970,7 +956,7 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
     if (Debug) {
       errs() << "Branch fusion reversed\n";
     }
-    F_new->eraseFromParent();
+    F_orig->eraseFromParent();
     mergeGenFailNum++;
     return F;
   }
@@ -1257,7 +1243,7 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
     if (Debug) {
       errs() << "Branch fusion reversed\n";
     }
-    F_new->eraseFromParent();
+    F_orig->eraseFromParent();
     return F;
   }
 
@@ -1307,13 +1293,21 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
     errs() << "After deleting the old code\n";
     // F->dump();
   }
-  if (!commitChanges(F_new)) {
+  if (!commitChanges(F)) {
     // F.dump();
     errs() << "ERROR: committing final changes to the fused branches "
               "!!!!!!!\n";
-    F_new->eraseFromParent();
+    it.first->EntryBlock = clonedLeftEntry;
+    it.first->ExitBlock = clonedLeftExit;
+    it.second->EntryBlock = clonedRightEntry;
+    it.second->ExitBlock = clonedRightExit;
+    F->replaceAllUsesWith(F_orig);
+    F->eraseFromParent();
+    F_orig->setName(Name);
+    DT.recalculate(*F_orig);
+    PDT.recalculate(*F_orig);
     commitChangesErrorNum++;
-    return F;
+    return F_orig;
   }
   if (Debug) {
     errs() << "Final version\n";
@@ -1322,12 +1316,12 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
 
   SimplifyCFGOptions SimplifyCFGOptionsObj;
 
-  simplifyFunction(*F_new, TTI,
+  simplifyFunction(*F, TTI,
                    SimplifyCFGOptionsObj.setSimplifyCondBranch(false)
                        .sinkCommonInsts(false)
                        .hoistCommonInsts(false));
 
-  SizeAfter = EstimateFunctionSize(F_new, TTI);
+  SizeAfter = EstimateFunctionSize(F, TTI);
 
   if (Debug) {
     errs() << "*SizeOrig: " << SizeOrig << "\n";
@@ -1335,16 +1329,9 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
   }
 
   if (SizeAfter < SizeOrig - matchThreshold && rgs > regionSizeThreshold) {
-    errs() << "RGMSuccess\n";
-    it.first->EntryBlock = clonedLeftEntry;
-    it.first->ExitBlock = clonedLeftExit;
-    it.second->EntryBlock = clonedRightEntry;
-    it.second->ExitBlock = clonedRightExit;
-    F->replaceAllUsesWith(F_new);
-    F->eraseFromParent();
-    F_new->setName(Name);
-    DT.recalculate(*F_new);
-    PDT.recalculate(*F_new);
+    F_orig->eraseFromParent();
+    DT.recalculate(*F);
+    PDT.recalculate(*F);
     mergeRegionPairsNum++;
     regionSize += (SizeOrig - SizeAfter) * 100.0 / SizeOrig;
     // hasBranchFusion = hasBranchFusion || bfcase;
@@ -1365,11 +1352,17 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
     //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreSucc",
     //   num);
     // }
-    return F_new;
+    return F;
   } else {
-    F_new->eraseFromParent();
-    DT.recalculate(*F);
-    PDT.recalculate(*F);
+    it.first->EntryBlock = clonedLeftEntry;
+    it.first->ExitBlock = clonedLeftExit;
+    it.second->EntryBlock = clonedRightEntry;
+    it.second->ExitBlock = clonedRightExit;
+    F->replaceAllUsesWith(F_orig);
+    F->eraseFromParent();
+    F_orig->setName(Name);
+    DT.recalculate(*F_orig);
+    PDT.recalculate(*F_orig);
     notProfitableGlobalNum++;
     // if (match.similarityScores <= 0.45) {
     //   int num;
@@ -1387,7 +1380,7 @@ static Function *regionMerging(Function *F, DominatorTree &DT,
     //   writeCounter("/home/smallhanley/sslab/work/benchmark/SPEC/fileMoreFail",
     //   num);
     // }
-    return F;
+    return F_orig;
   }
 }
 

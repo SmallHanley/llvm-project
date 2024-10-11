@@ -87,7 +87,7 @@ bool Utils::isValidMergeLocation(BasicBlock &BB, DominatorTree &DT,
           << ", This case is not considered\n";
     return false;
   }
-
+  BI->dump();
   // FIXME : filter regions that contain swithc instructions for now
   BasicBlock *IPDom = PDT.getNode(&BB)->getIDom()->getBlock();
   SmallVector<BasicBlock *, 32> WorkList;
